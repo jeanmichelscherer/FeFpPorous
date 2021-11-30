@@ -1,0 +1,103 @@
+@DSL ImplicitFiniteStrain;
+@Behaviour ImplicitFeFpViscoPlasticity;
+@Author Thomas Helfer;
+@Date 13 / 09 / 2021;
+@Description {
+}
+
+//@UseQt true;
+
+@Algorithm NewtonRaphson;
+@Epsilon 1.e-14;
+@Theta 1;
+
+@ModellingHypothesis Tridimensional;
+
+@ElasticMaterialProperties {150e9, 0.3};
+
+@AuxiliaryStateVariable DeformationGradientTensor Fp;
+Fp.setEntryName("PlasticPartOfTheDeformationGradient");
+
+@IntegrationVariable StrainStensor eel;
+
+@LocalVariable DeformationGradientTensor Fe_tr;
+@LocalVariable DeformationGradientTensor iFp;
+@LocalVariable DeformationGradientTensor idFp;
+@LocalVariable StiffnessTensor De;
+@LocalVariable Stensor4 Je;
+@LocalVariable tfel::math::st2tot2<N,real> didFp_ddeel;
+
+@Parameter stress M0 = 100e6;
+@Parameter strainrate de0 = 1e-4;
+@Parameter real E = 2.4;
+
+@InitializeLocalVariables {
+  De = lambda * Stensor4::IxI() + 2 * mu * Stensor4::Id();
+  iFp = invert(Fp);
+  const auto Fe = F0 * iFp;
+  eel = computeGreenLagrangeTensor(Fe);
+  Fe_tr = F1 * iFp;
+}
+
+@Integrator {
+  const auto id = Stensor::Id();
+  const auto uid = Tensor::Id();
+  constexpr const auto eeps = real(1.e-14);
+  const auto seps = young * eeps;
+  //
+  const auto eel_ets = eel + deel;
+  const auto S = De * eel_ets;
+  const auto M = eval((id + 2 * eel_ets) * S);
+  const auto dM_ddeel =
+      st2tot2<N, real>{2 * st2tot2<N, real>::tpld(S) +
+                       st2tot2<N, real>::tprd(id + 2 * eel_ets, De)};
+  const auto Mdev = M - trace(M) / 3 * uid;
+  const auto Meq = sqrt(3 * (Mdev | Mdev) / 2);
+  const auto iMeq = 1 / max(Meq, seps);
+  const auto n = 3 * Mdev * (iMeq / 2);
+  const auto vp = de0 * pow(Meq/M0, E);
+  idFp = uid - dt * vp * n;
+  // current estimate of the elastic part of the deformation gradient at the end
+  // of the time step
+  const auto Fe = Fe_tr * (idFp / cbrt(det(idFp)));
+  const auto egl = computeGreenLagrangeTensor(Fe);
+  feel = eel + deel - egl;
+  // jacobian
+  const auto degl_didFp =
+      t2tost2<N, real>::dCdF(Fe) * t2tot2<N, real>::tprd(Fe_tr) / 2;
+  const auto dvp_dMeq = E * vp * iMeq;
+  const auto uM = (3 * t2tot2<N, real>::K()) / 2;
+  const auto dn_dM = iMeq * (uM - (n ^ n));
+  const auto didFp_dM = -dt * dvp_dMeq * (n ^ n) - dt * vp * dn_dM;
+  didFp_ddeel = didFp_dM * dM_ddeel;
+  Je = Stensor4::Id() - degl_didFp * didFp_ddeel;
+  dfeel_ddeel = Je;
+}
+
+@ComputeFinalStress {
+  const auto Fe = Fe_tr * idFp;
+  const auto S = De * eel;
+  sig = convertSecondPiolaKirchhoffStressToCauchyStress(S,Fe);
+}
+
+@UpdateAuxiliaryStateVariables {
+  Fp = eval(invert(idFp) * Fp);
+  Fp /= cbrt(det(Fp));
+}
+
+@TangentOperator<DTAU_DF> {
+  const auto Fe = Fe_tr * idFp;
+  const auto S = De * eel;
+  const auto dCe_dFe = t2tost2<N, real>::dCdF(Fe);
+  const auto dS_dFe = De * dCe_dFe / 2;
+  t2tost2<N, stress> dtau_dFe;
+  computePushForwardDerivative(dtau_dFe, dS_dFe, S, Fe);
+  // now we need dFe_dF
+  const auto dFe_tr_dF = t2tot2<N, real>::tpld(iFp);
+  const auto dfeel_dF = -dCe_dFe * t2tot2<N, real>::tpld(idFp, dFe_tr_dF) / 2;
+  const auto ddeel_dF = -invert(Je) * dfeel_dF;
+  const auto didFp_dF = didFp_ddeel * ddeel_dF;
+  const auto dFe_dF = t2tot2<N, real>::tpld(idFp, dFe_tr_dF) +
+                      t2tot2<N, real>::tprd(Fe_tr, didFp_dF);
+  Dt = dtau_dFe * dFe_dF;
+}

@@ -1,0 +1,413 @@
+@DSL ImplicitFiniteStrain;
+@Behaviour GursonImplicitFeFpViscoPlasticity;
+@Author Thomas Helfer;
+@Date 13 / 09 / 2021;
+@Description {
+}
+
+@Includes {
+ #include "TFEL/Math/ScalarNewtonRaphson.hxx"
+ #include "TFEL/Math/tensor.hxx"
+}
+
+//@UseQt true;
+
+//@Algorithm NewtonRaphson;
+
+@Algorithm NewtonRaphson_NumericalJacobian;
+@PerturbationValueForNumericalJacobianComputation 1e-8;
+
+@Epsilon 1.e-14;
+@Theta 1;
+
+@ModellingHypothesis Tridimensional;
+
+@ElasticMaterialProperties {200e3, 0.3};
+
+//@IntegrationVariable StrainStensor eel;
+@StateVariable DeformationGradientTensor Fe;
+Fe.setEntryName("ElasticPartOfTheDeformationGradient");
+@StateVariable real p;
+@StateVariable real f;
+//f.setGlossaryName("f");
+
+@AuxiliaryStateVariable StrainStensor eel;
+@AuxiliaryStateVariable DeformationGradientTensor Fp;
+Fp.setEntryName("PlasticPartOfTheDeformationGradient");
+@AuxiliaryStateVariable real fstar;
+@AuxiliaryStateVariable real sigstar;
+@AuxiliaryStateVariable real broken;
+
+@LocalVariable DeformationGradientTensor Fe_tr;
+@LocalVariable DeformationGradientTensor Fm1;
+@LocalVariable DeformationGradientTensor iFp;
+@LocalVariable DeformationGradientTensor idFp;
+@LocalVariable StiffnessTensor De;
+@LocalVariable Stensor4 Je;
+@LocalVariable tfel::math::st2tot2<N,real> didFp_ddeel;
+@LocalVariable Tensor normal;
+@LocalVariable real df_e;
+@LocalVariable bool bp;
+@LocalVariable bool bf;
+@LocalVariable size_t iter_f;
+
+@MaterialProperty real q_1 ;
+q_1.setEntryName("q_1");
+@MaterialProperty real q_2 ;
+q_2.setEntryName("q_2");
+@MaterialProperty real q_3 ;
+q_3.setEntryName("q_3");
+@MaterialProperty real A0 ;
+A0.setEntryName("A0");
+@MaterialProperty real Q1 ;
+Q1.setEntryName("Q1");
+@MaterialProperty real b1 ;
+b1.setEntryName("b1");
+@MaterialProperty real Q2 ;
+Q2.setEntryName("Q2");
+@MaterialProperty real b2 ;
+b2.setEntryName("b2");
+@MaterialProperty real H ;
+H.setEntryName("H");
+@MaterialProperty real f_c ;
+f_c.setEntryName("f_c");
+@MaterialProperty real f_r ;
+f_r.setEntryName("f_r");
+@MaterialProperty real gamma0 ;
+gamma0.setEntryName("gamma0");
+@MaterialProperty real K ;
+K.setEntryName("K");
+@MaterialProperty real n ;
+n.setEntryName("n");
+
+@InitializeLocalVariables {
+  De = lambda * Stensor4::IxI() + 2 * mu * Stensor4::Id();
+  iFp = invert(Fp);
+  const auto Fe_ = F1 * iFp; //F0 * iFp;
+  eel = computeGreenLagrangeTensor(Fe_);
+  //Fe_tr = F1 * iFp;
+
+  // elastic prediction
+  df_e = real{};
+  iter_f = size_t{};
+  bf = false;
+  if (broken < 0.5) {
+    constexpr const auto eeps = real(1.e-14);
+    const auto seps = young * eeps;
+  
+// to be factorized 
+    const auto S = De * eel;
+    const auto id = Stensor::Id();
+    const auto uid = Tensor::Id();
+    const auto M = eval((id + 2 * eel) * S);
+    const auto Mm = trace(M) / 3;
+    const auto Mdev = M - Mm * uid;
+    const auto Meq = sqrt(3 * (Mdev | Mdev) / 2);
+    const auto iMeq = 1 / max(Meq, seps);
+    const auto Mm2 = Mm * Mm;
+    const auto Meq2 = Meq * Meq;
+    const auto delta = ((1. / q_1) - f_c) / (f_r - f_c);
+    fstar = (f < f_c) ? f : (f_c + delta * (f - f_c));
+    if (std::abs(Mm) < seps) {
+      const auto iomf = 1 / std::max(1 - 2 * q_1 * fstar + q_3 * fstar * fstar, real(1.e-12));
+      sigstar = Meq * std::sqrt(iomf);
+    }
+    else if (Meq < seps) {
+      const auto argach = (1 + q_3 * fstar * fstar) / std::max(2 * q_1 * fstar, real(1.e-12));
+      const auto den = 2 * std::acosh(argach);
+      sigstar = (3 * q_2 * Mm) / den;
+    } else {  
+      //const auto SdS = [Meq2, Mm, fstar](const auto x) {
+      const auto SdS = [&](const auto x) {
+          const auto fstar2 = fstar * fstar;
+          const auto e = std::exp(3 * q_2 * Mm * (x / 2));
+          const auto ch = (e + 1 / e) / 2;
+          const auto sh = (e - 1 / e) / 2;
+          const auto S = Meq2 * x * x + 2 * q_1 * fstar * ch - 1 - q_3 * fstar2;
+          const auto dS = 2 * Meq2 * x + 3 * q_1 * q_2 * fstar * Mm * sh;
+          return std::make_tuple(S, dS);
+      };
+      const auto c = [seps, S](const real, const auto dx, const auto x,
+                              const size_t) {
+          // First criterion based on the value of the yield surface
+          //if (std::abs(S) < seps) {
+          //  return true;
+          //}
+          // d(1/y) = -dy/(y*y) => y*y*d(1/y) = -dy
+          // so if I want |dy|<eps, |y*y*d(1/y)| must be lower than eps
+          // Here, x is the inverse of the equivalent stress, so
+          return 10 * std::abs(dx) < seps * std::abs(x * x);
+      };
+      const auto x0 = std::sqrt((4 * (1 + q_3 * fstar * fstar - 2 * q_1 * fstar)) / (4 * Meq2 + 9 * q_1 * q_2 * q_2 * fstar * Mm2));
+      //std::cout << "x0 = " << x0 << '\n';
+      const auto r = tfel::math::scalarNewtonRaphson(SdS, c, x0, size_t{100});
+      //std::cout << "r = " << (1/std::get<1>(r)) << '\n';
+      if (!std::get<0>(r)) {
+        throw(DivergenceException());
+      };
+      sigstar = 1 / std::get<1>(r);
+    }
+//
+    double R  =  A0 + Q1 * (1. - exp(-b1 * p)) + Q2 * (1. - exp(-b2 * p)) + H * p ;
+    bp = sigstar > R;
+    //std::cout << "bp = " << bp << '\n';
+  } else {
+    bp = true;
+  }
+}
+
+@Integrator {
+/**/
+  if (!bp) {
+    // elastic loading, nothing to be done
+    fFe = dFe - (F1 - F0);
+    return true;
+  }
+/**/
+  if (broken > 0.5) {
+    fFe = Fe + dFe;
+  } else {
+    Fm1 = invert(F1);
+    //const auto seps = strain{1e-12} * young;
+    const auto f_ = min(max(f + theta * df, real(0)), real(1));
+    const double pt    = max(p + theta * dp, strain(0));
+    const auto Fe_ets = Fe + theta * dFe;
+    const auto eel_ets = computeGreenLagrangeTensor(Fe_ets);
+    const auto S = De * eel_ets;
+    constexpr const auto eeps = real(1.e-14);
+    const auto seps = young * eeps;
+    
+
+// to be factorized
+//
+    const auto id = Stensor::Id();
+    const auto uid = Tensor::Id();
+    const auto M = eval((uid + 2 * eel_ets) * S);
+    const auto Mm = trace(M) / 3;
+    const auto Mdev = M - Mm * uid;
+    const auto Meq = sqrt(3 * (Mdev | Mdev) / 2);
+    const auto iMeq = 1 / max(Meq, seps);
+    const auto Mm2 = Mm * Mm;
+    const auto Meq2 = Meq * Meq;
+    const auto delta = ((1. / q_1) - f_c) / (f_r - f_c);
+    fstar = (f < f_c) ? f : (f_c + delta * (f - f_c));
+    const auto dfstar = (f < f_c) ? 1. : delta;
+
+    //compute sigstar
+    fstar = (f < f_c) ? f : (f_c + delta * (f - f_c));
+    if (std::abs(Mm) < seps) {
+      const auto iomf = 1 / std::max(1 - 2 * q_1 * fstar + q_3 * fstar * fstar, real(1.e-12));
+      sigstar = Meq * std::sqrt(iomf);
+    }
+    else if (Meq < seps) {
+      const auto argach = (1 + q_3 * fstar * fstar) / std::max(2 * q_1 * fstar, real(1.e-12));
+      const auto den = 2 * std::acosh(argach);
+      sigstar = (3 * q_2 * Mm) / den;
+    } else {
+      //const auto SdS = [Meq2, Mm, fstar](const auto x) {
+      const auto SdS = [&](const auto x) {
+          const auto fstar2 = fstar * fstar;
+          const auto e = std::exp(3 * q_2 * Mm * (x / 2));
+          const auto ch = (e + 1 / e) / 2;
+          const auto sh = (e - 1 / e) / 2;
+          const auto S = Meq2 * x * x + 2 * q_1 * fstar * ch - 1 - q_3 * fstar2;
+          const auto dS = 2 * Meq2 * x + 3 * q_1 * q_2 * fstar * Mm * sh;
+          return std::make_tuple(S, dS);
+      };
+      const auto c = [seps, S](const real, const auto dx, const auto x,
+                              const size_t) {
+          // First criterion based on the value of the yield surface
+          //if (std::abs(S) < seps) {
+          //  return true;
+          //}
+          // d(1/y) = -dy/(y*y) => y*y*d(1/y) = -dy
+          // so if I want |dy|<eps, |y*y*d(1/y)| must be lower than eps
+          // Here, x is the inverse of the equivalent stress, so
+          return 10 * std::abs(dx) < seps * std::abs(x * x);
+      };
+      const auto x0 = std::sqrt((4 * (1 + q_3 * fstar * fstar - 2 * q_1 * fstar)) / (4 * Meq2 + 9 * q_1 * q_2 * q_2 * fstar * Mm2));
+      const auto r = tfel::math::scalarNewtonRaphson(SdS, c, x0, size_t{100});
+      if (!std::get<0>(r)) {
+        throw(DivergenceException());
+      };
+      sigstar = 1 / std::get<1>(r);
+    }
+    //compute normal
+    const auto iss = 1 / std::max(sigstar, seps);
+    const auto e = std::exp(3 * q_2 * Mm * iss / 2);
+    const auto ch = (e + 1 / e) / 2;
+    const auto sh = (e - 1 / e) / 2;
+    const auto q1q2 = q_1 * q_2;
+    const auto dphi_dss =
+      (-2 * power<2>(Meq) * iss - 3 * q1q2 * fstar  * Mm * sh) * power<2>(iss);
+    const auto sgn = (dphi_dss < 0) ? -1 : 1;
+    const auto idphi_dss =
+      sgn * ((tfel::math::ieee754::fpclassify(dphi_dss) == FP_ZERO)
+             ? 1 / seps
+             : 1 / std::abs(dphi_dss));
+    const auto dphi_dsig = 3 * power<2>(iss) * Mdev + //
+      q1q2 * fstar * iss * sh * uid;
+    normal = -dphi_dsig * idphi_dss;
+    //normal = eval(-dphi_dsig * idphi_dss);
+
+    // second derivative of the normal
+    const auto MM = 1.5 * (t2tot2<N, real>::Id() - ((1./3.) * (uid ^ uid))) ; // tfel::math::t2tot2<N,double>::M();
+    const auto d2phi_dsig2    = (2. * MM + (q1q2 * q_2 * (fstar / 2) * ch * (uid ^ uid)))  * power<2>(iss)  ;
+    const auto d2phi_dsigdss  = (-6. * Mdev * iss - q1q2 * fstar * sh * uid - //
+                               3 * q1q2 * q_2 * (fstar / 2) * Mm * iss * ch * uid) * power<2>(iss) ;
+    const auto d2phi_dss2     = ((6 * Meq2 * iss) + (3 * q1q2 * fstar * Mm) * //
+                               (2 * sh + 3 * q_2 * Mm * (iss / 2) * ch)) * power<3>(iss);
+    const auto dn_dsig = - idphi_dss * (d2phi_dsig2 + (d2phi_dsigdss ^ normal)) + //
+      power<2>(idphi_dss) * (dphi_dsig ^ (d2phi_dsigdss + (d2phi_dss2 * normal)));
+
+
+    // derivative of \(\sigma^{\star}\) with respect to \(f\)
+    const auto dphi_df = (2 * q_1 * ch - 2 * q_3 * fstar) * dfstar;
+    const auto dss_df = -dphi_df * idphi_dss;
+
+    // derivatives with respect to \(f\)
+    const auto d2phi_dssdf  = (-3. * q1q2 * Mm * power<2>(iss) * sh) * dfstar;
+    const auto d2phi_dsigdf = (q1q2 * iss * sh * id) * dfstar;
+    const auto dn_df        = -idphi_dss * (d2phi_dsigdf + (d2phi_dssdf * normal)) + //
+      power<2>(idphi_dss) * ((d2phi_dsigdss + (d2phi_dss2 * normal)) * dphi_df);
+
+//
+
+    const auto dM_ddeel =
+        st2tot2<N, real>{2 * st2tot2<N, real>::tpld(S) +
+                         st2tot2<N, real>::tprd(id + 2 * eel_ets, De)};
+    //const auto vp = de0 * pow(Meq/M0, E);
+    //idFp = uid - dt * vp * n;
+    // current estimate of the elastic part of the deformation gradient at the end
+    // of the time step
+    //const auto Fe = Fe_tr * (idFp / cbrt(det(idFp)));
+
+    double R  =  A0 + Q1 * (1. - exp(-b1 * pt)) + Q2 * (1. - exp(-b2 * pt)) + H * pt ;
+
+    fFe = dFe - (F1 - F0) * Fm1 * Fe_ets + Fe_ets * (1 - f_) * dp * normal;
+    fp  = (dp - dt * gamma0 * pow( max( (sigstar - R) / K, 0.), n )) / young;
+    // jacobian
+    //const auto degl_didFp =
+    //    t2tost2<N, real>::dCdF(Fe) * t2tot2<N, real>::tprd(Fe_tr) / 2;
+    //const auto dvp_dMeq = E * vp * iMeq;
+    //const auto uM = (3 * t2tot2<N, real>::K()) / 2;
+    //const auto dn_dM = iMeq * (uM - (n ^ n));
+    //const auto didFp_dM = -dt * dvp_dMeq * (n ^ n) - dt * vp * dn_dM;
+    //didFp_ddeel = didFp_dM * dM_ddeel;
+    //Je = Stensor4::Id() - degl_didFp * didFp_ddeel;
+    //dfeel_ddeel = Je;
+/*
+    dfFe_ddFe  = t2tot2<N, real>::Id() - t2tot2<N, real>::tprd ( (F1 - F0) * Fm1 ) + t2tot2<N, real>::tpld( (1 - f_) * dp * normal ) ;
+    dfFe_ddp   = Fe_ets * (1 - f_) * normal;
+    dfFe_ddf   = -theta * dp * normal + theta * (1 - f_) * dp * dn_df ;
+    dfp_ddFe   = 1.e8*Tensor::Id() ; //to be implemented
+    dfp_ddp    = 1 ;
+    dfp_ddf    = 1 ; //to be implemented
+*/
+    if (bf) {
+      ff -= power<2>(1 - f_) * dp * trace(normal);
+/*
+      dff_ddf += 2 * theta * (1 - f_) * dp * trace(normal) - power<2>(1 - f_) * dp * trace(dn_df);
+      dff_ddp = -power<2>(1 - f_) * trace(n);
+      dff_ddFe -= ; // to be implemented // theta * power<2>(1 - f_) * dp * (Stensor::Id() | (dn_ds * D));
+*/
+    } else {
+      ff -= df_e;
+    }
+//    std::cout << "normal = " << normal << '\n';
+/*
+    std::cout << "sigstar = " << sigstar << '\n';
+    std::cout << "fp = " << fp << '\n';
+    std::cout << "ff = " << ff << '\n';
+    std::cout << "fFe = " << fFe << '\n';
+    std::cout << "sig = " << sig << '\n';
+    std::cout << "S = " << S << '\n';
+    std::cout << "Fe = " << Fe << '\n';
+*/
+  }
+}
+
+@ComputeFinalStress {
+  //const auto Fe = Fe_tr * idFp;
+  Fp  = invert(Fe)*F1;
+  eel = computeGreenLagrangeTensor(Fe);
+  const auto S = De * eel;
+  sig = convertSecondPiolaKirchhoffStressToCauchyStress(S,Fe);
+/*
+  std::cout << "eel = " << eel << '\n';
+  std::cout << "cauchy = " << sig << '\n';
+*/
+}
+
+/*
+@UpdateAuxiliaryStateVariables {
+  Fp = eval(invert(idFp) * Fp);
+  Fp /= cbrt(det(Fp));
+}
+*/
+
+@TangentOperator<DTAU_DF> {
+  //const auto Fe = Fe_tr * idFp;
+  const auto S = De * eel;
+  const auto dCe_dFe = t2tost2<N, real>::dCdF(Fe);
+  const auto dS_dFe = De * dCe_dFe / 2;
+  t2tost2<N, stress> dtau_dFe;
+  computePushForwardDerivative(dtau_dFe, dS_dFe, S, Fe);
+  // now we need dFe_dF
+  const auto dFe_tr_dF = t2tot2<N, real>::tpld(iFp);
+  const auto dfeel_dF = -dCe_dFe * t2tot2<N, real>::tpld(idFp, dFe_tr_dF) / 2;
+  const auto ddeel_dF = -invert(Je) * dfeel_dF;
+  const auto didFp_dF = didFp_ddeel * ddeel_dF;
+  const auto dFe_dF = t2tot2<N, real>::tpld(idFp, dFe_tr_dF) +
+                      t2tot2<N, real>::tprd(Fe_tr, didFp_dF);
+  Dt = dtau_dFe * dFe_dF;
+}
+
+@AdditionalConvergenceChecks{
+  if (converged && bp && (broken < 0.5)) {
+    if (!bf) {
+/*
+      // new porosity increment estimate;
+      const auto dfg_1 = [&, this]() -> real {
+        const auto p_ = p + theta * dp;
+        if (p_ < p_n) {
+          return 0;
+        }
+        const auto vp = sig.computeEigenValues();
+        const auto s1 = *(tfel::fsalgo::max_element<3u>::exe(vp.begin()));
+        if (s1 < s1_n) {
+          return 0;
+        }
+        return An0 * pow(s1 / s1_n - 1, ng) * dp;
+      }();
+      dfg_e = min(dfg_1, fg_max - fg);
+*/
+      const auto f_ = f + df_e;
+
+      auto df_n = power<2>(1 - f_) * dp * trace(normal) ; // + dfg_e;
+      if (f_ + df_n > 0.99 * f_r) {
+        df_n = (f_ + 0.99 * f_r) / 2 - f;
+      }
+      auto ddf = df_n - df_e;
+
+      if (abs(ddf) < 1e-10) {
+        bf = true;
+        if (f_ > 0.985 * f_r) {
+          broken = true;
+        }
+      } else {
+      //  std::cout << "ddf: " << ddf << '\n';
+        if (iter_f > 100) {
+          throw(DivergenceException());
+        }
+        iter = 0;
+        ++iter_f;
+        df_e = df_n;
+        converged = false;
+      }
+    } else {
+      std::cout << "iter: " << iter << '\n';
+    }
+  }
+  //std::cout << "converged = " << converged << '\n';
+}
